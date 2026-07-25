@@ -25,11 +25,13 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-sys.path.insert(0, "/workspace/zap")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = REPO_ROOT.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-DATA_ROOT = "/workspace/zap/data/eval/MileBench"
-DEFAULT_OUTPUT_DIR = "/workspace/zap/results/onevision_milebench"
-LOG_ROOT = "/workspace/zap/logs/onevision_milebench"
+DATA_ROOT = str(WORKSPACE_ROOT / "data" / "eval" / "MileBench")
+DEFAULT_OUTPUT_DIR = str(REPO_ROOT / "results" / "onevision_milebench")
+LOG_ROOT = str(REPO_ROOT / "logs" / "onevision_milebench")
 DEFAULT_IMAGE_TOKEN = "<image>"
 MAX_NEW_TOKENS = 32
 
@@ -86,17 +88,34 @@ def build_prompt(sample: dict, meta: dict) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", required=True)
-    parser.add_argument("--pretrained", default="/workspace/zap/model/llava-onevision-qwen2-7b-ov")
-    parser.add_argument("--student_path", default="/workspace/zap/ckpts/student_onevision_A_ep20")
+    parser.add_argument(
+        "--pretrained",
+        default=str(WORKSPACE_ROOT / "models" / "llava-onevision-qwen2-7b-ov"),
+    )
+    parser.add_argument(
+        "--student_path",
+        default=str(REPO_ROOT / "ckpts" / "student_onevision"),
+    )
     parser.add_argument("--keep_ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--text_eviction_mode",
+        choices=("none", "streamingllm", "h2o"),
+        default="none",
+    )
+    parser.add_argument("--text_keep_ratio", type=float, default=0.2)
+    parser.add_argument("--text_cache_size", type=int, default=0)
+    parser.add_argument("--h2o_recent_ratio", type=float, default=0.5)
+    parser.add_argument("--streaming_sink_size", type=int, default=4)
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--data_root", default=DATA_ROOT)
+    parser.add_argument("--log_root", default=LOG_ROOT)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max_new_tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    log_file = Path(LOG_ROOT) / f"{args.dataset}.log"
+    log_file = Path(args.log_root) / f"{args.dataset}.log"
     with _tee_to_file(log_file):
         _run(args)
 
@@ -111,17 +130,18 @@ def _run(args):
         return
 
     # Load data
-    data_path = os.path.join(DATA_ROOT, args.dataset, f"{args.dataset}.json")
+    data_path = os.path.join(args.data_root, args.dataset, f"{args.dataset}.json")
     data = json.load(open(data_path))
     meta = data["meta_data"]
     samples = data["data"]
     if args.limit is not None:
         samples = samples[:args.limit]
-    combined_img_root = os.path.join(DATA_ROOT, args.dataset, "combined_1_images")
+    combined_img_root = os.path.join(args.data_root, args.dataset, "combined_1_images")
 
     print(
         f"[{args.dataset}] {len(samples)} samples | keep_ratio={args.keep_ratio} "
-        f"keep_ratio_basis=image max_new_tokens={args.max_new_tokens}"
+        f"keep_ratio_basis=image text_eviction={args.text_eviction_mode} "
+        f"text_keep_ratio={args.text_keep_ratio} max_new_tokens={args.max_new_tokens}"
     )
 
     # Load student model (reuse existing class — no duplication)
@@ -132,6 +152,11 @@ def _run(args):
         keep_ratio=args.keep_ratio,
         device=args.device,
         stats_output_dir=task_out,
+        text_eviction_mode=args.text_eviction_mode,
+        text_keep_ratio=args.text_keep_ratio,
+        text_cache_size=args.text_cache_size,
+        h2o_recent_ratio=args.h2o_recent_ratio,
+        streaming_sink_size=args.streaming_sink_size,
     )
 
     predictions = []

@@ -24,6 +24,7 @@ if REPO_ROOT not in sys.path:
 
 from kvpress.presses.visual_utility_student_onevision import VisualUtilityStudentOneVision
 from .kv_decode_utils import greedy_decode_with_kv, trim_kv_cache_per_layer
+from .text_kv_eviction import TextKVConfig, greedy_decode_with_text_eviction
 
 try:
     from lmms_eval import utils
@@ -51,6 +52,11 @@ class LmmsOnevisionStudent(lmms):
         attn_implementation: str = "sdpa",
         stats_output_dir: str = "",
         conv_template: str = "qwen_1_5",
+        text_eviction_mode: str = "none",
+        text_keep_ratio: float = 0.2,
+        text_cache_size: int = 0,
+        h2o_recent_ratio: float = 0.5,
+        streaming_sink_size: int = 4,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -67,6 +73,13 @@ class LmmsOnevisionStudent(lmms):
         self.student = self.student.to(device=self._device, dtype=torch.float16).eval()
         self.keep_ratio = float(keep_ratio)
         self.stats_output_dir = stats_output_dir
+        self.text_kv_config = TextKVConfig(
+            mode=text_eviction_mode,
+            keep_ratio=float(text_keep_ratio),
+            cache_size=int(text_cache_size),
+            h2o_recent_ratio=float(h2o_recent_ratio),
+            streaming_sink_size=int(streaming_sink_size),
+        ).normalized()
         self._reported_keep_budget = False
         self._img_keep_sum = 0
         self._img_total_sum = 0
@@ -198,6 +211,11 @@ class LmmsOnevisionStudent(lmms):
         summary = {
             "task": task_name,
             "keep_ratio": self.keep_ratio,
+            "text_eviction_mode": self.text_kv_config.mode,
+            "text_keep_ratio": self.text_kv_config.keep_ratio,
+            "text_cache_size": self.text_kv_config.cache_size,
+            "h2o_recent_ratio": self.text_kv_config.h2o_recent_ratio,
+            "streaming_sink_size": self.text_kv_config.streaming_sink_size,
             "n_samples": n,
             "avg_image_token_ratio": sum(s["image_token_ratio"] for s in self._keep_stats) / n,
             "avg_text_token_ratio": sum(s["text_token_ratio"] for s in self._keep_stats) / n,
@@ -207,6 +225,19 @@ class LmmsOnevisionStudent(lmms):
             "avg_n_image_kept": sum(s["n_image_kept"] for s in self._keep_stats) / n,
             "samples": self._keep_stats,
         }
+        average_fields = {
+            "text_cache_budget": "avg_text_cache_budget",
+            "n_text_prompt_original": "avg_n_text_prompt_original",
+            "avg_n_text_prompt_kept_after_eviction": "avg_n_text_prompt_kept_after_eviction",
+            "text_prompt_keep_ratio_after_eviction": "avg_text_prompt_keep_ratio_after_eviction",
+            "avg_n_text_cache_final": "avg_n_text_cache_final",
+            "avg_n_visual_cache_final": "avg_n_visual_cache_final",
+            "text_eviction_events": "avg_text_eviction_events",
+        }
+        for sample_key, summary_key in average_fields.items():
+            summary[summary_key] = sum(
+                float(sample.get(sample_key, 0.0)) for sample in self._keep_stats
+            ) / n
         out_dir = self.stats_output_dir or os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
         fname = f"{task_name or 'unknown'}_keep_ratio_stats.json"
@@ -223,7 +254,11 @@ class LmmsOnevisionStudent(lmms):
     def _generate_llava(self, context: str, visuals, max_new_tokens: int) -> str:
         """Generation path for LLaVA-format checkpoint (llava-onevision-qwen2-7b-ov)."""
         from qvik.llava_onevision.conversation import conv_templates
-        from qvik.llava_onevision.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN as LLAVA_DEFAULT_IMAGE_TOKEN
+        from qvik.llava_onevision.constants import (
+            DEFAULT_IMAGE_TOKEN as LLAVA_DEFAULT_IMAGE_TOKEN,
+            IGNORE_INDEX,
+            IMAGE_TOKEN_INDEX,
+        )
 
         # Build prompt via conv template
         conv = conv_templates[self._conv_template].copy()
@@ -243,7 +278,9 @@ class LmmsOnevisionStudent(lmms):
             self._tokenizer.pad_token_id if self._tokenizer.pad_token_id is not None else self._tokenizer.eos_token_id
         ).to(self._device)
 
-        if not visuals or self.keep_ratio >= 1.0:
+        if not visuals or (
+            self.keep_ratio >= 1.0 and self.text_kv_config.mode == "none"
+        ):
             # Fallback: standard generate
             image_tensor = self._llava_process_images(visuals, self._image_processor, self._config) if visuals else None
             if image_tensor is not None:
@@ -274,38 +311,39 @@ class LmmsOnevisionStudent(lmms):
 
         # Expand image tokens via prepare_inputs_labels_for_multimodal
         try:
-            _, _, new_attn_mask, _, inputs_embeds, _ = self._model.prepare_inputs_labels_for_multimodal(
-                input_ids, None, attention_mask, None, None,
+            # Supplying labels gives us an exact expanded visual-token mask:
+            # multimodal preparation replaces every image feature label with
+            # IGNORE_INDEX while preserving labels for all text positions.
+            _, _, new_attn_mask, _, inputs_embeds, expanded_labels = self._model.prepare_inputs_labels_for_multimodal(
+                input_ids, None, attention_mask, None, input_ids.clone(),
                 image_tensor, ["image"], image_sizes,
             )
         except Exception as e:
             print(f"[lmms-onevision-student] prepare_inputs_labels failed ({e}), skipping.", file=sys.stderr, flush=True)
             return ""
 
-        # Compute image positions in expanded sequence (single-image case)
+        # Compute the exact visual positions after variable-length, multi-image
+        # feature expansion.
         input_ids_1d = input_ids[0][attention_mask[0].bool()]
         n_img_placeholders = int((input_ids_1d == IMAGE_TOKEN_INDEX).sum().item())
-        n_text_tokens = int(input_ids_1d.shape[0]) - n_img_placeholders
         prompt_len = int(inputs_embeds.shape[1])
-        n_img = prompt_len - n_text_tokens
-
-        if n_img_placeholders == 1:
-            placeholder_pos = int((input_ids_1d == IMAGE_TOKEN_INDEX).nonzero(as_tuple=True)[0][0].item())
-            image_positions = torch.arange(placeholder_pos, placeholder_pos + n_img, dtype=torch.long)
-        else:
-            print("[lmms-onevision-student] WARNING: multi-image in llava mode not supported, using fallback.", file=sys.stderr, flush=True)
-            try:
-                out = self._model.generate(
-                    input_ids, attention_mask=attention_mask,
-                    images=image_tensor, image_sizes=image_sizes,
-                    max_new_tokens=max_new_tokens, do_sample=False, use_cache=True,
-                    pad_token_id=self._tokenizer.eos_token_id,
-                )
-                return self._tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
-            except Exception:
-                return ""
-
-        n_text = n_text_tokens
+        if expanded_labels is None:
+            raise RuntimeError("Expanded labels are required to locate OneVision image KVs.")
+        image_positions = (
+            (expanded_labels[0] == IGNORE_INDEX)
+            .nonzero(as_tuple=False)
+            .flatten()
+            .detach()
+            .cpu()
+        )
+        n_img = int(image_positions.numel())
+        n_text = prompt_len - n_img
+        if n_img_placeholders != len(visuals) or n_img == 0:
+            raise RuntimeError(
+                "OneVision image expansion mismatch: "
+                f"placeholders={n_img_placeholders} images={len(visuals)} "
+                f"expanded_visual_tokens={n_img}."
+            )
         n_keep = max(1, int(math.ceil(n_img * self.keep_ratio)))
 
         self._img_keep_sum += n_keep
@@ -379,11 +417,24 @@ class LmmsOnevisionStudent(lmms):
             torch.cuda.empty_cache()
         past_kv = trim_kv_cache_per_layer(past_kv, keep_masks)
 
-        answer_ids = greedy_decode_with_kv(
-            self._model, past_kv, next_token,
-            prompt_len=prompt_len,
-            eos_token_id=eos_token_id, max_new_tokens=max_new_tokens,
-        )
+        if self.text_kv_config.mode == "none":
+            answer_ids = greedy_decode_with_kv(
+                self._model, past_kv, next_token,
+                prompt_len=prompt_len,
+                eos_token_id=eos_token_id, max_new_tokens=max_new_tokens,
+            )
+        else:
+            answer_ids, text_stats = greedy_decode_with_text_eviction(
+                self._model,
+                past_kv,
+                next_token,
+                prompt_len=prompt_len,
+                image_positions=image_positions,
+                visual_keep_masks=keep_masks,
+                eos_token_id=eos_token_id,
+                max_new_tokens=max_new_tokens,
+                config=self.text_kv_config,
+            )
+            self._keep_stats[-1].update(text_stats)
         torch.cuda.empty_cache()
         return self._tokenizer.decode(answer_ids.tolist(), skip_special_tokens=True).strip()
-

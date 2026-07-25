@@ -135,3 +135,75 @@ for ds in ALFRED CLEVR-Change IEdit Spot-the-Diff; do
     --keep_ratio 0.5
 done
 ```
+
+### Sequential Q-ViK + text KV eviction
+
+The LLaVA-1.5 and OneVision evaluation wrappers can apply a second, text-only
+cache policy after Q-ViK has selected the visual tokens. Visual survivors are
+always protected by the second stage.
+
+- `text_eviction_mode=none`: Q-ViK only (control).
+- `text_eviction_mode=streamingllm`: keep initial text sinks plus recent text.
+- `text_eviction_mode=h2o`: keep per-head attention heavy hitters plus recent
+  text. Scores are accumulated from decode queries instead of materializing the
+  quadratic prefill attention matrix.
+- `text_cache_size=N`: fixed number of text KV entries (overrides the ratio).
+- `text_keep_ratio=0.2`: text budget as a fraction of prompt text when the
+  fixed size is zero.
+- `h2o_recent_ratio=0.5`: fraction of the H2O text budget reserved for recent
+  entries; the remainder is the heavy-hitter budget.
+- `streaming_sink_size=4`: number of initial text entries protected by
+  StreamingLLM.
+
+H2O with a 20% total text cache (10% heavy hitters + 10% recent):
+
+```bash
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python qvik/eval/run_lmms_eval.py \
+  --model lmms_llava15_student \
+  --model_args pretrained=model/llava-v1.5-7b,student_path=ckpts/student_llava15,keep_ratio=0.5,keep_ratio_basis=image,text_eviction_mode=h2o,text_keep_ratio=0.2,h2o_recent_ratio=0.5,device=cuda:0 \
+  --tasks textvqa,chartqa,docvqa,gqa \
+  --batch_size 1 \
+  --output_path results/qvik_h2o
+```
+
+StreamingLLM with a fixed 512-entry text cache:
+
+```bash
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python qvik/eval/run_lmms_eval.py \
+  --model lmms_onevision_student \
+  --model_args pretrained=model/llava-onevision-qwen2-7b-ov,student_path=ckpts/student_onevision,keep_ratio=0.5,text_eviction_mode=streamingllm,text_cache_size=512,streaming_sink_size=4,device=cuda:0 \
+  --tasks textvqa,chartqa,docvqa,gqa \
+  --batch_size 1 \
+  --output_path results/qvik_streamingllm
+```
+
+The keep-ratio stats JSON records both stages, including
+`n_image_kept`, `text_cache_budget`,
+`avg_n_text_prompt_kept_after_eviction`, and
+`avg_n_visual_cache_final`.
+
+For the downloaded MM-NIAH text-needle validation split, run the native
+LLaVA-1.5 <=2K sanity slice directly:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python qvik/eval/mm_niah_llava15_student.py \
+  --task retrieval-text \
+  --keep_ratio 0.5 \
+  --keep_ratio_basis image \
+  --text_eviction_mode h2o \
+  --text_keep_ratio 0.2 \
+  --max_expanded_tokens 2048
+```
+
+Repeat with `counting-text` and `reasoning-text`, and with
+`text_eviction_mode=none,streamingllm,h2o`. Each run writes detailed
+predictions, cache statistics, and an official-format JSONL under
+`official_outputs/`. The latter can be checked with the upstream scorer:
+
+```bash
+python ../MM-NIAH/calculate_scores.py \
+  --outputs-dir results/mm_niah/<run>/official_outputs
+```
+
+See `docs/long_text_eviction.md` for the full long-context benchmark order and
+ablation matrix.

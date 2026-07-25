@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import pickle
 import sys
@@ -54,6 +55,10 @@ from .kv_decode_utils import (  # noqa: E402
     SinkAbsorbPlan,
     greedy_decode_with_kv,
     trim_kv_cache_per_layer,
+)
+from .text_kv_eviction import (  # noqa: E402
+    TextKVConfig,
+    greedy_decode_with_text_eviction,
 )
 from .visual_sink_utils import (  # noqa: E402
     VisualSinkDetection,
@@ -146,6 +151,7 @@ class LmmsLlava15Student(lmms):
         student_path: str = "/workspace/zap/ckpts/student_llava15_900_e15",
         vision_tower_path: str = "",
         keep_ratio: float = 0.5,
+        keep_ratio_basis: str = "total",
         device: str = "cuda:0",
         device_map: str = "cuda:0",
         model_name: Optional[str] = None,
@@ -165,6 +171,11 @@ class LmmsLlava15Student(lmms):
         visual_sink_threshold: float = 8.0,
         visual_sink_max_ratio: float = 0.10,
         visual_sink_measure_mass: bool | str = False,
+        text_eviction_mode: str = "none",
+        text_keep_ratio: float = 0.2,
+        text_cache_size: int = 0,
+        h2o_recent_ratio: float = 0.5,
+        streaming_sink_size: int = 4,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -207,6 +218,9 @@ class LmmsLlava15Student(lmms):
             self.student = None
         self.student_path = student_path
         self.keep_ratio = float(keep_ratio)
+        self.keep_ratio_basis = str(keep_ratio_basis).strip().lower()
+        if self.keep_ratio_basis not in {"total", "image"}:
+            raise ValueError("keep_ratio_basis must be either 'total' or 'image'.")
         self.conv_template = conv_template
         self.max_new_tokens = int(max_new_tokens)
         self.image_feature_len = int(image_feature_len)
@@ -222,6 +236,13 @@ class LmmsLlava15Student(lmms):
         self.visual_sink_threshold = float(visual_sink_threshold)
         self.visual_sink_max_ratio = float(visual_sink_max_ratio)
         self.visual_sink_measure_mass = str(visual_sink_measure_mass).lower() in {"1", "true", "yes", "on"}
+        self.text_kv_config = TextKVConfig(
+            mode=text_eviction_mode,
+            keep_ratio=float(text_keep_ratio),
+            cache_size=int(text_cache_size),
+            h2o_recent_ratio=float(h2o_recent_ratio),
+            streaming_sink_size=int(streaming_sink_size),
+        ).normalized()
         if self.sink_count > 0:
             self._attach_sink_tokens()
         self._rank = 0
@@ -406,11 +427,17 @@ class LmmsLlava15Student(lmms):
         summary = {
             "task": task_name,
             "keep_ratio": self.keep_ratio,
+            "keep_ratio_basis": self.keep_ratio_basis,
             "eviction_mode": self.eviction_mode,
             "sink_count": self.sink_count,
             "visual_sink_layer": self.visual_sink_layer,
             "visual_sink_threshold": self.visual_sink_threshold,
             "visual_sink_measure_mass": self.visual_sink_measure_mass,
+            "text_eviction_mode": self.text_kv_config.mode,
+            "text_keep_ratio": self.text_kv_config.keep_ratio,
+            "text_cache_size": self.text_kv_config.cache_size,
+            "h2o_recent_ratio": self.text_kv_config.h2o_recent_ratio,
+            "streaming_sink_size": self.text_kv_config.streaming_sink_size,
             "n_samples": n,
             "avg_image_token_ratio": sum(s["image_token_ratio"] for s in self._keep_stats) / n,
             "avg_text_token_ratio": sum(s["text_token_ratio"] for s in self._keep_stats) / n,
@@ -420,19 +447,29 @@ class LmmsLlava15Student(lmms):
             "avg_n_image_kept": sum(s["n_image_kept"] for s in self._keep_stats) / n,
             "samples": self._keep_stats,
         }
-        for key in (
-            "n_visual_sink",
-            "visual_sink_ratio",
-            "visual_sink_score_mean",
-            "visual_sink_score_max",
-            "visual_sink_keep_pollution",
-            "visual_sink_kept_ratio",
-            "visual_sink_mass_share",
-            "visual_total_mass_share",
-            "visual_sink_mass_within_image",
-            "visual_non_sink_mass_share",
-        ):
-            summary[f"avg_{key}"] = sum(float(s.get(key, 0.0)) for s in self._keep_stats) / n
+        average_fields = {
+            "n_visual_sink": "avg_n_visual_sink",
+            "visual_sink_ratio": "avg_visual_sink_ratio",
+            "visual_sink_score_mean": "avg_visual_sink_score_mean",
+            "visual_sink_score_max": "avg_visual_sink_score_max",
+            "visual_sink_keep_pollution": "avg_visual_sink_keep_pollution",
+            "visual_sink_kept_ratio": "avg_visual_sink_kept_ratio",
+            "visual_sink_mass_share": "avg_visual_sink_mass_share",
+            "visual_total_mass_share": "avg_visual_total_mass_share",
+            "visual_sink_mass_within_image": "avg_visual_sink_mass_within_image",
+            "visual_non_sink_mass_share": "avg_visual_non_sink_mass_share",
+            "text_cache_budget": "avg_text_cache_budget",
+            "n_text_prompt_original": "avg_n_text_prompt_original",
+            "avg_n_text_prompt_kept_after_eviction": "avg_n_text_prompt_kept_after_eviction",
+            "text_prompt_keep_ratio_after_eviction": "avg_text_prompt_keep_ratio_after_eviction",
+            "avg_n_text_cache_final": "avg_n_text_cache_final",
+            "avg_n_visual_cache_final": "avg_n_visual_cache_final",
+            "text_eviction_events": "avg_text_eviction_events",
+        }
+        for sample_key, summary_key in average_fields.items():
+            summary[summary_key] = sum(
+                float(sample.get(sample_key, 0.0)) for sample in self._keep_stats
+            ) / n
         out_dir = self.stats_output_dir or os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
         fname = f"{task_name or 'unknown'}_keep_ratio_stats.json"
@@ -482,7 +519,9 @@ class LmmsLlava15Student(lmms):
 
         visual_sink_modes = {"visual_sink_stats", "visual_sink_drop", "visual_sink_aware_topk"}
         needs_prefill = image_tensor is not None and num_images > 0 and (
-            self.eviction_mode in visual_sink_modes or self.keep_ratio < 1.0
+            self.eviction_mode in visual_sink_modes
+            or self.keep_ratio < 1.0
+            or self.text_kv_config.mode != "none"
         )
         needs_student = self.eviction_mode in {"drop", "sink_absorb", "visual_sink_aware_topk"}
         if not needs_prefill or (needs_student and self.student is None):
@@ -537,7 +576,10 @@ class LmmsLlava15Student(lmms):
 
         n_img = int(image_positions.numel())
         n_text = int(prompt_len) - n_img
-        n_keep = max(1, int(round(n_img - (1.0 - self.keep_ratio) * int(prompt_len))))
+        if self.keep_ratio_basis == "image":
+            n_keep = max(1, math.ceil(n_img * self.keep_ratio))
+        else:
+            n_keep = max(1, round(n_img - (1.0 - self.keep_ratio) * int(prompt_len)))
         n_keep = min(n_keep, n_img)
 
         last_img = int(image_positions.max().item())
@@ -623,14 +665,28 @@ class LmmsLlava15Student(lmms):
         del H_all
         absorb_plan = self._sink_absorb_plan(input_ids, keep_masks, drop_weights)
         past_kv = trim_kv_cache_per_layer(past_kv, keep_masks, absorb_plan)
-        answer_ids = greedy_decode_with_kv(
-            self._model,
-            past_kv,
-            next_token,
-            prompt_len=int(prompt_len),
-            eos_token_id=eos_token_id,
-            max_new_tokens=max_new_tokens,
-        )
+        if self.text_kv_config.mode == "none":
+            answer_ids = greedy_decode_with_kv(
+                self._model,
+                past_kv,
+                next_token,
+                prompt_len=int(prompt_len),
+                eos_token_id=eos_token_id,
+                max_new_tokens=max_new_tokens,
+            )
+        else:
+            answer_ids, text_stats = greedy_decode_with_text_eviction(
+                self._model,
+                past_kv,
+                next_token,
+                prompt_len=int(prompt_len),
+                image_positions=image_positions,
+                visual_keep_masks=keep_masks,
+                eos_token_id=eos_token_id,
+                max_new_tokens=max_new_tokens,
+                config=self.text_kv_config,
+            )
+            self._keep_stats[-1].update(text_stats)
         torch.cuda.empty_cache()
         return self._tokenizer.decode(answer_ids.tolist(), skip_special_tokens=True).strip()
 
@@ -754,7 +810,8 @@ class LmmsLlava15Student(lmms):
         )
         if not self._reported_keep_budget:
             print(
-                f"[lmms-llava15-student] mode={self.eviction_mode} keep_ratio_basis=total "
+                f"[lmms-llava15-student] mode={self.eviction_mode} "
+                f"keep_ratio_basis={self.keep_ratio_basis} "
                 f"keep_ratio={self.keep_ratio} prompt_len={prompt_len} image_tokens={n_img} "
                 f"text_tokens={n_text} image_tokens_kept={n_keep} "
                 f"visual_sinks={visual_detection.count}",
