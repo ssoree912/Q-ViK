@@ -71,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
         "--max_expanded_tokens",
         type=int,
         default=2048,
-        help="Metadata estimate: text tokens + 576 tokens per image + 80 chat tokens.",
+        help="Exact tokenized prompt limit after chat templating and image expansion.",
     )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=32)
@@ -90,17 +90,11 @@ def _load_rows(args: argparse.Namespace) -> list[dict]:
     filtered: list[dict] = []
     for row in rows:
         text_tokens = int(row["meta"]["context_length_text"])
-        num_images = int(row["meta"]["num_images"])
-        expanded_estimate = text_tokens + 576 * num_images + 80
         if text_tokens < args.min_text_tokens:
             continue
         if args.max_text_tokens > 0 and text_tokens > args.max_text_tokens:
             continue
-        if args.max_expanded_tokens > 0 and expanded_estimate > args.max_expanded_tokens:
-            continue
         filtered.append(row)
-    if args.limit > 0:
-        filtered = filtered[: args.limit]
     return filtered
 
 
@@ -124,6 +118,23 @@ def _resolve_images(row: dict, image_root: Path) -> list[Image.Image]:
             f"Missing {len(missing)} MM-NIAH image(s); first missing: {missing[0]}"
         )
     return [Image.open(path).convert("RGB") for path in paths]
+
+
+def _expanded_prompt_tokens(wrapper: LmmsLlava15Student, row: dict) -> int:
+    num_images = len(row["images_list"])
+    prompt = wrapper._build_prompt(_format_question(row), [None] * num_images)
+    input_ids = tokenizer_image_token(
+        prompt,
+        wrapper.tokenizer,
+        IMAGE_TOKEN_INDEX,
+        return_tensors="pt",
+    )
+    num_placeholders = int((input_ids == IMAGE_TOKEN_INDEX).sum().item())
+    if num_placeholders != num_images:
+        raise ValueError(
+            f"Image placeholder mismatch: prompt={num_placeholders} files={num_images}"
+        )
+    return int(input_ids.numel()) + num_placeholders * (wrapper.image_feature_len - 1)
 
 
 @torch.no_grad()
@@ -177,12 +188,6 @@ def main() -> None:
     )
     official_predictions_path = official_dir / f"{model_tag}_{args.task}-val.jsonl"
 
-    print(
-        f"[MM-NIAH] task={args.task} samples={len(rows)} "
-        f"text_eviction={args.text_eviction_mode} "
-        f"text_range=[{args.min_text_tokens or 0},"
-        f"{args.max_text_tokens or 'inf'}] max_expanded={args.max_expanded_tokens}"
-    )
     wrapper = LmmsLlava15Student(
         pretrained=args.pretrained,
         student_path=args.student_path,
@@ -197,6 +202,29 @@ def main() -> None:
         device_map=args.device,
         max_new_tokens=args.max_new_tokens,
         stats_output_dir=str(output_dir),
+    )
+
+    expanded_lengths = {
+        row["id"]: _expanded_prompt_tokens(wrapper, row)
+        for row in tqdm(rows, desc=f"{args.task} length filter")
+    }
+    if args.max_expanded_tokens > 0:
+        rows = [
+            row
+            for row in rows
+            if expanded_lengths[row["id"]] <= args.max_expanded_tokens
+        ]
+    if args.limit > 0:
+        rows = rows[: args.limit]
+    if not rows:
+        raise RuntimeError("No MM-NIAH rows remain after exact token-length filtering.")
+    print(
+        f"[MM-NIAH] task={args.task} samples={len(rows)} "
+        f"text_eviction={args.text_eviction_mode} "
+        f"text_range=[{args.min_text_tokens or 0},"
+        f"{args.max_text_tokens or 'inf'}] max_expanded={args.max_expanded_tokens} "
+        f"actual_expanded=[{min(expanded_lengths[row['id']] for row in rows)},"
+        f"{max(expanded_lengths[row['id']] for row in rows)}]"
     )
 
     records: list[dict] = []
@@ -232,6 +260,7 @@ def main() -> None:
                 "mm_niah_score": sample_score,
                 "context_length_text": row["meta"]["context_length_text"],
                 "context_length": row["meta"]["context_length"],
+                "expanded_prompt_tokens": expanded_lengths[row["id"]],
                 "num_images": row["meta"]["num_images"],
                 "placed_depth": row["meta"]["placed_depth"],
                 "error": error,

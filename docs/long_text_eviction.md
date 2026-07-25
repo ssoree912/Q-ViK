@@ -48,10 +48,11 @@ The downloaded MM-NIAH validation annotations have the following
 | reasoning-text | 520 | 9,856 | 45,161 | 58,607 |
 
 This makes the full split a substantially better test of text eviction than
-the short VQA tasks. Only 69 retrieval, 72 counting, and 73 reasoning examples
-fit the current conservative LLaVA-1.5 expanded-sequence estimate of 2,048
-tokens. Use those rows only as an implementation sanity check; the main result
-must use a long-context model over the same complete examples.
+the short VQA tasks. After applying the actual Vicuna chat template and
+expanding every image placeholder to 576 tokens, only 32 retrieval, 44
+counting, and 45 reasoning examples fit within 2,048 tokens. Use those rows
+only as an implementation sanity check; the main result must use a
+long-context model over the same complete examples.
 
 ## Ablation matrix
 
