@@ -221,5 +221,26 @@ The runner encodes multi-image AnyRes inputs sequentially, filters on the
 exact expanded prompt length, and saves each prediction immediately so an
 interrupted run resumes without repeating completed samples.
 
+Apply Q-ViK to 50% of visual KVs and then H2O to a 50% text-KV budget on the
+same native-32K MM-NIAH subset:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
+  python qvik/eval/mm_niah_onevision_full.py \
+  --pretrained ../models/llava-onevision-qwen2-7b-ov \
+  --student_path ckpts/student_onevision \
+  --visual_keep_ratio 0.5 \
+  --text_eviction_mode h2o \
+  --text_keep_ratio 0.5 \
+  --h2o_recent_ratio 0.5 \
+  --max_expanded_tokens 32736 \
+  --max_new_tokens 32 \
+  --output_dir results/mm_niah_onevision_qvik0.5_h2o0.5_32k
+```
+
+The visual ratio is applied independently at every layer. The H2O text budget
+is 50% of the original prompt-text count and is split equally between heavy
+hitters and recent entries; Q-ViK visual survivors are protected from H2O.
+
 See `docs/long_text_eviction.md` for the full long-context benchmark order and
 ablation matrix.

@@ -1,8 +1,9 @@
-"""Resumable full-cache MM-NIAH evaluation for original LLaVA-OneVision.
+"""Resumable MM-NIAH evaluation for original LLaVA-OneVision.
 
-The runner evaluates the public text-needle tasks with no visual or text KV
-eviction.  It computes the exact prompt length after OneVision AnyRes image
-expansion and only prefills samples that fit in the requested native window.
+The runner evaluates the public text-needle tasks either with full KV caches or
+with sequential Q-ViK visual eviction followed by text-only H2O eviction.  It
+computes the exact prompt length after OneVision AnyRes image expansion and
+only prefills samples that fit in the requested native window.
 """
 
 from __future__ import annotations
@@ -27,7 +28,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import qvik.llava_onevision  # noqa: F401  # Register original LLaVA classes.
+from kvpress.presses.visual_utility_student_onevision import (
+    VisualUtilityStudentOneVision,
+)
+from qvik.eval.kv_decode_utils import trim_kv_cache_per_layer
 from qvik.eval.mm_niah_scoring import score_mm_niah_answer
+from qvik.eval.text_kv_eviction import (
+    TextKVConfig,
+    greedy_decode_with_text_eviction,
+)
 from qvik.llava_onevision.constants import IMAGE_TOKEN_INDEX
 from qvik.llava_onevision.conversation import conv_templates
 from qvik.llava_onevision.mm_utils import (
@@ -73,6 +82,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--attn_implementation", default="sdpa")
+    parser.add_argument(
+        "--student_path",
+        type=Path,
+        default=REPO_ROOT / "ckpts" / "student_onevision",
+    )
+    parser.add_argument(
+        "--visual_keep_ratio",
+        type=float,
+        default=1.0,
+        help="Q-ViK image-token keep ratio. Use 1.0 for no visual eviction.",
+    )
+    parser.add_argument(
+        "--text_eviction_mode",
+        choices=("none", "h2o"),
+        default="none",
+    )
+    parser.add_argument("--text_keep_ratio", type=float, default=1.0)
+    parser.add_argument("--h2o_recent_ratio", type=float, default=0.5)
     parser.add_argument(
         "--output_dir",
         type=Path,
@@ -245,6 +272,7 @@ def _prepare_exact_multimodal(
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
+    torch.Tensor | None,
     int,
     bool,
 ]:
@@ -314,17 +342,31 @@ def _prepare_exact_multimodal(
         expanded_lower_bound = num_text_tokens + num_visual_tokens
         if expanded_lower_bound > max_expanded_tokens:
             del visual_features
-            return None, None, None, expanded_lower_bound, False
+            return None, None, None, None, expanded_lower_bound, False
 
     pieces: list[torch.Tensor] = []
+    image_position_chunks: list[torch.Tensor] = []
     cursor = 0
+    expanded_cursor = 0
     for position, visual_feature in zip(placeholder_positions, visual_features):
         if position > cursor:
-            pieces.append(model.get_model().embed_tokens(input_ids_1d[cursor:position]))
+            text_piece = model.get_model().embed_tokens(input_ids_1d[cursor:position])
+            pieces.append(text_piece)
+            expanded_cursor += int(text_piece.shape[0])
         pieces.append(visual_feature)
+        image_position_chunks.append(
+            torch.arange(
+                expanded_cursor,
+                expanded_cursor + int(visual_feature.shape[0]),
+                dtype=torch.long,
+            )
+        )
+        expanded_cursor += int(visual_feature.shape[0])
         cursor = position + 1
     if cursor < input_ids_1d.numel():
-        pieces.append(model.get_model().embed_tokens(input_ids_1d[cursor:]))
+        text_piece = model.get_model().embed_tokens(input_ids_1d[cursor:])
+        pieces.append(text_piece)
+        expanded_cursor += int(text_piece.shape[0])
     inputs_embeds = torch.cat(pieces, dim=0).unsqueeze(0)
     expanded_tokens = int(inputs_embeds.shape[1])
     if expanded_tokens != num_text_tokens + num_visual_tokens:
@@ -337,7 +379,20 @@ def _prepare_exact_multimodal(
         dtype=torch.bool,
         device=device,
     )
-    return inputs_embeds, None, expanded_attention_mask, expanded_tokens, True
+    image_positions = torch.cat(image_position_chunks)
+    if int(image_positions.numel()) != num_visual_tokens:
+        raise RuntimeError(
+            f"Visual position mismatch: positions={image_positions.numel()} "
+            f"features={num_visual_tokens}"
+        )
+    return (
+        inputs_embeds,
+        None,
+        expanded_attention_mask,
+        image_positions,
+        expanded_tokens,
+        True,
+    )
 
 
 def _eos_token_ids(model, tokenizer) -> set[int]:
@@ -418,6 +473,155 @@ def _full_cache_generate(
     return prediction, prefill_seconds, decode_seconds
 
 
+@torch.no_grad()
+def _qvik_h2o_generate(
+    model,
+    tokenizer,
+    student: VisualUtilityStudentOneVision,
+    inputs_embeds: torch.Tensor,
+    position_ids: torch.Tensor | None,
+    attention_mask: torch.Tensor | None,
+    image_positions: torch.Tensor,
+    max_new_tokens: int,
+    visual_keep_ratio: float,
+    text_config: TextKVConfig,
+) -> tuple[str, float, float, dict[str, Any]]:
+    """Prefill once, apply Q-ViK per layer, then decode with text H2O."""
+    prompt_len = int(inputs_embeds.shape[1])
+    image_positions_cpu = image_positions.detach().cpu().long()
+    image_positions_device = image_positions_cpu.to(inputs_embeds.device)
+    num_visual_tokens = int(image_positions_cpu.numel())
+    num_visual_kept = max(1, int(math.ceil(num_visual_tokens * visual_keep_ratio)))
+    last_image_position = int(image_positions_cpu.max().item())
+    question_positions = torch.arange(
+        last_image_position + 1,
+        prompt_len,
+        dtype=torch.long,
+        device=inputs_embeds.device,
+    )
+
+    decoder_layers = model.model.layers
+    missing_layers = [
+        layer_idx
+        for layer_idx in student.layer_indices
+        if layer_idx >= len(decoder_layers)
+    ]
+    if missing_layers:
+        raise ValueError(
+            f"Student layer indices exceed model depth {len(decoder_layers)}: "
+            f"{missing_layers}"
+        )
+
+    layer_scores: dict[int, torch.Tensor] = {}
+    hooks = []
+    for layer_idx in student.layer_indices:
+        student_layer = student.layers[str(layer_idx)]
+
+        def _score_hook(_module, _inputs, output, *, li=layer_idx, scorer=student_layer):
+            hidden_states = output[0] if isinstance(output, tuple) else output
+            scores = scorer(
+                hidden_states,
+                image_positions_device,
+                question_positions,
+            ).squeeze(0)
+            layer_scores[li] = scores.detach()
+
+        hooks.append(decoder_layers[layer_idx].register_forward_hook(_score_hook))
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    prefill_start = time.perf_counter()
+    try:
+        outputs = model.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+    if len(layer_scores) != len(student.layer_indices):
+        raise RuntimeError(
+            f"Q-ViK scored {len(layer_scores)} layers, expected "
+            f"{len(student.layer_indices)}."
+        )
+    last_hidden = outputs.last_hidden_state[:, -1:, :]
+    first_next_token = model.lm_head(last_hidden).argmax(dim=-1)
+    past_kv = outputs.past_key_values
+
+    keep_masks: dict[int, torch.Tensor] = {}
+    if num_visual_kept < num_visual_tokens:
+        for layer_idx, scores in layer_scores.items():
+            top_indices = torch.topk(
+                scores,
+                k=num_visual_kept,
+                largest=True,
+            ).indices.detach().cpu()
+            mask = torch.ones(prompt_len, dtype=torch.bool)
+            visual_keep = torch.zeros(num_visual_tokens, dtype=torch.bool)
+            visual_keep[top_indices] = True
+            mask[image_positions_cpu] = visual_keep
+            keep_masks[layer_idx] = mask
+
+    del outputs, last_hidden, layer_scores, inputs_embeds
+    past_kv = trim_kv_cache_per_layer(past_kv, keep_masks)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    prefill_seconds = time.perf_counter() - prefill_start
+
+    decode_start = time.perf_counter()
+    eos_token_id = int(tokenizer.eos_token_id)
+    answer_ids, text_stats = greedy_decode_with_text_eviction(
+        model,
+        past_kv,
+        first_next_token,
+        prompt_len=prompt_len,
+        image_positions=image_positions_cpu,
+        visual_keep_masks=keep_masks,
+        eos_token_id=eos_token_id,
+        max_new_tokens=max_new_tokens,
+        config=text_config,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    decode_seconds = time.perf_counter() - decode_start
+    del past_kv
+
+    stats: dict[str, Any] = {
+        "n_image_original": num_visual_tokens,
+        "n_image_kept": num_visual_kept,
+        "image_keep_ratio": num_visual_kept / max(1, num_visual_tokens),
+        "n_text_prompt_original": prompt_len - num_visual_tokens,
+        **text_stats,
+    }
+    prediction = tokenizer.decode(
+        answer_ids.tolist(),
+        skip_special_tokens=True,
+    ).strip()
+    return prediction, prefill_seconds, decode_seconds, stats
+
+
+def _uses_eviction(args: argparse.Namespace) -> bool:
+    return (
+        args.visual_keep_ratio < 1.0
+        or args.text_eviction_mode != "none"
+    )
+
+
+def _run_tag(args: argparse.Namespace) -> str:
+    if not _uses_eviction(args):
+        return "full"
+    return (
+        f"qvik{args.visual_keep_ratio:g}_"
+        f"{args.text_eviction_mode}_text{args.text_keep_ratio:g}"
+    )
+
+
 def _write_summary(
     args: argparse.Namespace,
     task: str,
@@ -448,6 +652,11 @@ def _write_summary(
             handle.write(json.dumps(official_record, ensure_ascii=False) + "\n")
 
     n = len(records)
+    cache_records = [
+        record["cache_stats"]
+        for record in records
+        if record.get("cache_stats")
+    ]
     summary = {
         "task": task,
         "n_annotation_rows": len(rows),
@@ -474,16 +683,63 @@ def _write_summary(
                 else 0.0
             ),
         },
+        "cache_stats": {
+            "avg_image_keep_ratio": (
+                sum(record["image_keep_ratio"] for record in cache_records)
+                / len(cache_records)
+                if cache_records
+                else 1.0
+            ),
+            "avg_text_prompt_keep_ratio_after_eviction": (
+                sum(
+                    record["text_prompt_keep_ratio_after_eviction"]
+                    for record in cache_records
+                )
+                / len(cache_records)
+                if cache_records
+                else 1.0
+            ),
+            "avg_n_image_original": (
+                sum(record["n_image_original"] for record in cache_records)
+                / len(cache_records)
+                if cache_records
+                else 0.0
+            ),
+            "avg_n_image_kept": (
+                sum(record["n_image_kept"] for record in cache_records)
+                / len(cache_records)
+                if cache_records
+                else 0.0
+            ),
+            "avg_n_text_prompt_original": (
+                sum(record["n_text_prompt_original"] for record in cache_records)
+                / len(cache_records)
+                if cache_records
+                else 0.0
+            ),
+            "avg_n_text_prompt_kept_after_eviction": (
+                sum(
+                    record["avg_n_text_prompt_kept_after_eviction"]
+                    for record in cache_records
+                )
+                / len(cache_records)
+                if cache_records
+                else 0.0
+            ),
+        },
         "official_predictions": str(official_predictions_path),
         "config": {
             **vars(args),
             "data_root": str(args.data_root),
             "image_root": str(args.image_root),
             "output_dir": str(args.output_dir),
+            "student_path": str(args.student_path),
             "tasks": list(args.tasks),
-            "cache_mode": "full",
-            "visual_eviction": "none",
-            "text_eviction": "none",
+            "cache_mode": "sequential" if _uses_eviction(args) else "full",
+            "visual_eviction": (
+                "qvik" if args.visual_keep_ratio < 1.0 else "none"
+            ),
+            "text_eviction": args.text_eviction_mode,
         },
     }
     with summary_path.open("w") as handle:
@@ -498,9 +754,12 @@ def _run_task(
     tokenizer,
     image_processor,
     device: torch.device,
+    student: VisualUtilityStudentOneVision | None,
+    text_config: TextKVConfig,
 ) -> None:
     rows = _load_rows(args, task)
-    output_dir = args.output_dir / f"{task}_onevision_full"
+    run_tag = _run_tag(args)
+    output_dir = args.output_dir / f"{task}_onevision_{run_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = output_dir / "predictions.jsonl"
     excluded_path = output_dir / "excluded_over_length.jsonl"
@@ -509,7 +768,7 @@ def _run_task(
     official_dir = output_dir / "official_outputs"
     official_dir.mkdir(parents=True, exist_ok=True)
     official_predictions_path = (
-        official_dir / f"llava-onevision-qwen2-7b-ov-full_{task}-val.jsonl"
+        official_dir / f"llava-onevision-qwen2-7b-ov-{run_tag}_{task}-val.jsonl"
     )
 
     previous_records = _read_jsonl(predictions_path)
@@ -520,7 +779,8 @@ def _run_task(
         ]
         _rewrite_jsonl(predictions_path, previous_records)
         print(
-            f"[MM-NIAH OneVision full] retrying {len(retry_records)} prior error(s) "
+            f"[MM-NIAH OneVision {run_tag}] retrying "
+            f"{len(retry_records)} prior error(s) "
             f"for {task}",
             flush=True,
         )
@@ -530,7 +790,7 @@ def _run_task(
     generated_this_run = 0
 
     progress = tqdm(
-        desc=f"{task} full-cache",
+        desc=f"{task} {run_tag}",
         initial=len(done),
         total=len(rows),
     )
@@ -546,6 +806,7 @@ def _run_task(
         num_visual_tokens = 0
         prefill_seconds = 0.0
         decode_seconds = 0.0
+        cache_stats: dict[str, Any] = {}
         sample_start = time.perf_counter()
         images: list[Image.Image] = []
         try:
@@ -597,6 +858,7 @@ def _run_task(
                 inputs_embeds,
                 position_ids,
                 expanded_attention_mask,
+                image_positions,
                 expanded_tokens,
                 exact_expanded_length,
             ) = _prepare_exact_multimodal(
@@ -637,19 +899,44 @@ def _run_task(
 
             if inputs_embeds is None:
                 raise RuntimeError("Eligible prompt has no prepared input embeddings.")
+            if image_positions is None:
+                raise RuntimeError("Eligible prompt has no visual position map.")
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)
-            prediction, prefill_seconds, decode_seconds = _full_cache_generate(
-                model,
-                tokenizer,
-                inputs_embeds,
-                position_ids,
-                expanded_attention_mask,
-                args.max_new_tokens,
-            )
+            if _uses_eviction(args):
+                if student is None:
+                    raise RuntimeError(
+                        "Q-ViK/H2O run requires the OneVision student."
+                    )
+                (
+                    prediction,
+                    prefill_seconds,
+                    decode_seconds,
+                    cache_stats,
+                ) = _qvik_h2o_generate(
+                    model,
+                    tokenizer,
+                    student,
+                    inputs_embeds,
+                    position_ids,
+                    expanded_attention_mask,
+                    image_positions,
+                    args.max_new_tokens,
+                    args.visual_keep_ratio,
+                    text_config,
+                )
+            else:
+                prediction, prefill_seconds, decode_seconds = _full_cache_generate(
+                    model,
+                    tokenizer,
+                    inputs_embeds,
+                    position_ids,
+                    expanded_attention_mask,
+                    args.max_new_tokens,
+                )
         except (
             FileNotFoundError,
             ValueError,
@@ -682,6 +969,7 @@ def _run_task(
             "placed_depth": row["meta"]["placed_depth"],
             "prefill_seconds": prefill_seconds,
             "decode_seconds": decode_seconds,
+            "cache_stats": cache_stats,
             "elapsed_seconds": time.perf_counter() - sample_start,
             "peak_allocated_gib": (
                 torch.cuda.max_memory_allocated(device) / (1024**3)
@@ -726,7 +1014,7 @@ def _run_task(
         summary_path,
     )
     print(
-        f"[MM-NIAH OneVision full] task={task} n={summary['n_samples']} "
+        f"[MM-NIAH OneVision {run_tag}] task={task} n={summary['n_samples']} "
         f"excluded={summary['n_excluded_over_length']} "
         f"unfinished={summary['n_unfinished']} errors={summary['n_errors']} "
         f"score={summary['mm_niah_accuracy']:.4f} -> {summary_path}",
@@ -736,6 +1024,13 @@ def _run_task(
 
 def main() -> None:
     args = _parse_args()
+    if not 0.0 < args.visual_keep_ratio <= 1.0:
+        raise ValueError("--visual_keep_ratio must be in (0, 1].")
+    text_config = TextKVConfig(
+        mode=args.text_eviction_mode,
+        keep_ratio=args.text_keep_ratio,
+        h2o_recent_ratio=args.h2o_recent_ratio,
+    ).normalized()
     device = torch.device(args.device)
     model_name = get_model_name_from_path(args.pretrained)
     tokenizer, model, image_processor, context_len = load_pretrained_model(
@@ -752,14 +1047,30 @@ def main() -> None:
             "Prompt plus generation exceeds native context: "
             f"{args.max_expanded_tokens}+{args.max_new_tokens}>{context_len}"
         )
+    student = None
+    if _uses_eviction(args):
+        student = VisualUtilityStudentOneVision.from_pretrained(args.student_path)
+        student = student.to(device=device, dtype=torch.float16).eval()
+    run_tag = _run_tag(args)
     print(
-        f"[MM-NIAH OneVision full] model={model_name} context={context_len} "
+        f"[MM-NIAH OneVision {run_tag}] model={model_name} context={context_len} "
         f"prompt_limit={args.max_expanded_tokens} max_new={args.max_new_tokens} "
+        f"visual_keep={args.visual_keep_ratio:g} "
+        f"text={args.text_eviction_mode}:{args.text_keep_ratio:g} "
         f"tasks={','.join(args.tasks)}",
         flush=True,
     )
     for task in args.tasks:
-        _run_task(args, task, model, tokenizer, image_processor, device)
+        _run_task(
+            args,
+            task,
+            model,
+            tokenizer,
+            image_processor,
+            device,
+            student,
+            text_config,
+        )
 
 
 if __name__ == "__main__":
