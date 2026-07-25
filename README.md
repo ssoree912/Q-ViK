@@ -205,5 +205,21 @@ python ../MM-NIAH/calculate_scores.py \
   --outputs-dir results/mm_niah/<run>/official_outputs
 ```
 
+Run the original-format LLaVA-OneVision model over every MM-NIAH row that
+fits its native 32K window with full visual and text KV caches:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES=0 \
+  python qvik/eval/mm_niah_onevision_full.py \
+  --pretrained ../models/llava-onevision-qwen2-7b-ov \
+  --max_expanded_tokens 32736 \
+  --max_new_tokens 32 \
+  --output_dir results/mm_niah_onevision_full_cache_32k
+```
+
+The runner encodes multi-image AnyRes inputs sequentially, filters on the
+exact expanded prompt length, and saves each prediction immediately so an
+interrupted run resumes without repeating completed samples.
+
 See `docs/long_text_eviction.md` for the full long-context benchmark order and
 ablation matrix.
