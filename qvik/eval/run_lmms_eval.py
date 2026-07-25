@@ -63,26 +63,32 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 # via `include:` and only override the dataset location. Datasets that ship only
 # the eval split locally use the parquet/arrow builder with explicit data_files
 # so HF doesn't try to infer a (missing) train/test split layout.
-DATA_ROOT = ZAP_ROOT / "data/eval"
+DATA_ROOT = Path(os.environ.get("QVIK_EVAL_DATA_ROOT", ZAP_ROOT.parent / "data/eval"))
 LOCAL_TASKS = {
     "textvqa": {
         "base": "textvqa/textvqa_val.yaml",
-        "dataset_path": "arrow",
+        "dataset_path": "parquet",
         "data_files": {
             "validation": str(
                 DATA_ROOT
-                / "TextVQA/lmms-lab___textvqa/default/0.0.0/*/textvqa-validation-*.arrow"
+                / "TextVQA/data/validation-*.parquet"
             )
         },
     },
     "chartqa": {
         "base": "chartqa/chartqa.yaml",
-        "dataset_path": str(DATA_ROOT / "ChartQA"),
+        "dataset_path": "parquet",
+        "data_files": {
+            "test": str(DATA_ROOT / "ChartQA/data/test-*.parquet"),
+        },
     },
     "docvqa": {
         "base": "docvqa/docvqa_val.yaml",
-        "dataset_path": str(DATA_ROOT / "DocVQA"),
+        "dataset_path": "parquet",
         "dataset_name": "DocVQA",
+        "data_files": {
+            "validation": str(DATA_ROOT / "DocVQA/DocVQA/validation-*.parquet"),
+        },
     },
     "gqa": {
         "base": "gqa/gqa.yaml",
@@ -177,10 +183,14 @@ def _flatten_model_subdir(task_out: Path) -> None:
     """lmms-eval nests results under <output_path>/<model_sanitized>/; lift them up."""
     if not task_out.is_dir():
         return
-    subdirs = [d for d in task_out.iterdir() if d.is_dir()]
-    if len(subdirs) != 1:
+    model_dirs = [
+        directory
+        for directory in task_out.iterdir()
+        if directory.is_dir() and any(directory.glob("*_results.json"))
+    ]
+    if len(model_dirs) != 1:
         return
-    model_dir = subdirs[0]
+    model_dir = model_dirs[0]
     for item in model_dir.iterdir():
         item.rename(task_out / item.name)
     model_dir.rmdir()
