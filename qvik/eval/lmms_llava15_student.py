@@ -501,6 +501,7 @@ class LmmsLlava15Student(lmms):
         def _safe_generate() -> str:
             out = self._model.generate(
                 inputs=input_ids,
+                attention_mask=torch.ones_like(input_ids, dtype=torch.long),
                 images=image_tensor,
                 do_sample=False,
                 num_beams=1,
