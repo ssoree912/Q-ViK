@@ -230,14 +230,42 @@ def _generate_answer(
     return answer_ids
 
 
-def _collect_attention_for_answer(
+def _normalize_teacher(teacher: torch.Tensor, eps: float) -> torch.Tensor:
+    """Normalize each layer's image-token scores into a distribution."""
+    return teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def _mix_teacher_signals(
+    question_teacher: torch.Tensor,
+    answer_teacher: torch.Tensor,
+    question_weight: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Mix separately normalized question and answer attention distributions."""
+    if not 0.0 <= question_weight <= 1.0:
+        raise ValueError(f"question_weight must be in [0, 1], got {question_weight}")
+    question_norm = _normalize_teacher(question_teacher, eps)
+    answer_norm = _normalize_teacher(answer_teacher, eps)
+    mixed = (
+        question_weight * question_norm
+        + (1.0 - question_weight) * answer_norm
+    )
+    return _normalize_teacher(mixed, eps), question_norm, answer_norm
+
+
+def _collect_attention_for_question_and_answer(
     model,
     inputs: dict,
     image_indices: torch.Tensor,
+    question_indices: torch.Tensor,
     prompt_len_mm: int,
     answer_ids: torch.Tensor,
-) -> tuple[torch.Tensor, int]:
-    """Run the attention pass only after the generated answer is accepted."""
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Collect question→image and answer→image attention in one full pass.
+
+    The model is causal, so question-token rows are identical to those from a
+    standalone prefill pass even though answer tokens are appended here.
+    """
     T = int(answer_ids.shape[1])
     full_input_ids = torch.cat([inputs["input_ids"], answer_ids], dim=1)  # [1, prompt+T]
 
@@ -255,26 +283,39 @@ def _collect_attention_for_answer(
     # Extract attention from answer positions to image positions
     L = len(full_out.attentions)
     n_img = int(image_indices.numel())
-    teacher = torch.zeros(L, n_img, dtype=torch.float32)
+    question_teacher = torch.zeros(L, n_img, dtype=torch.float32)
+    answer_teacher = torch.zeros(L, n_img, dtype=torch.float32)
 
     full_len_mm = prompt_len_mm + T
     answer_positions = list(range(prompt_len_mm, full_len_mm))
+    question_positions = question_indices.to(full_input_ids.device)
 
     if not answer_positions:
         # Model generated nothing (immediate EOS) — fall back to last prompt token
         answer_positions = [prompt_len_mm - 1]
+    if question_positions.numel() == 0:
+        # Defensive fallback for prompts whose image tokens end the prefill.
+        question_positions = torch.tensor(
+            [prompt_len_mm - 1], dtype=torch.long, device=full_input_ids.device
+        )
 
     for l, attn in enumerate(full_out.attentions):
         # attn: [B, H, T_mm, T_mm]
-        # Average attention from answer tokens to image positions
-        attn_to_img = attn[0, :, answer_positions, :].index_select(dim=-1, index=image_indices.to(attn.device))
-        # [H, T_answer, n_img] → average over heads then answer tokens
-        teacher[l] = attn_to_img.float().mean(dim=0).mean(dim=0).cpu()
+        image_indices_dev = image_indices.to(attn.device)
+        question_to_img = attn[0, :, question_positions, :].index_select(
+            dim=-1, index=image_indices_dev
+        )
+        answer_to_img = attn[0, :, answer_positions, :].index_select(
+            dim=-1, index=image_indices_dev
+        )
+        # [H, T_query, n_img] → average over heads and query tokens.
+        question_teacher[l] = question_to_img.float().mean(dim=(0, 1)).cpu()
+        answer_teacher[l] = answer_to_img.float().mean(dim=(0, 1)).cpu()
 
     del full_out
     gc.collect()
     torch.cuda.empty_cache()
-    return teacher, T
+    return question_teacher, answer_teacher, T
 
 
 @torch.no_grad()
@@ -294,8 +335,12 @@ def collect_one(
     answer_index: int | None = None,
     choices: tuple[str, ...] = (),
     require_correct: bool = True,
+    question_weight: float = 0.5,
     eps: float = 1e-8,
 ) -> tuple[dict | None, str]:
+    if not 0.0 <= question_weight <= 1.0:
+        raise ValueError(f"question_weight must be in [0, 1], got {question_weight}")
+
     inputs = prepare_inputs(tokenizer, image_processor, prompt, image, device)
     image_positions, prompt_len_mm = infer_image_positions_orig(inputs["input_ids"])
     image_indices = image_positions.to(device)
@@ -306,9 +351,11 @@ def collect_one(
     use_sampling = M > 1
     max_attempts = 1 if M == 1 else max(20, M * 10)
 
-    traj_scores: list[torch.Tensor] = []
+    question_traj_scores: list[torch.Tensor] = []
+    answer_traj_scores: list[torch.Tensor] = []
     t_lengths: list[int] = []
     predictions: list[str] = []
+    prediction_correctness: list[bool] = []
     last_prediction = ""
     for _ in range(max_attempts):
         answer_ids = _generate_answer(
@@ -321,47 +368,65 @@ def collect_one(
         )
         prediction = tokenizer.decode(answer_ids[0], skip_special_tokens=True).strip()
         last_prediction = prediction
-        prediction_correct = (
-            is_correct_prediction(
-                dataset,
-                prediction,
-                answers,
-                answer_index=answer_index,
-                choices=choices,
-            )
-            if require_correct
-            else True
+        prediction_correct = is_correct_prediction(
+            dataset,
+            prediction,
+            answers,
+            answer_index=answer_index,
+            choices=choices,
         )
-        if not prediction_correct:
+        if require_correct and not prediction_correct:
             del answer_ids
             if M == 1:
                 return None, prediction
             continue
 
-        score, T = _collect_attention_for_answer(
+        question_score, answer_score, T = _collect_attention_for_question_and_answer(
             model=model,
             inputs=inputs,
             image_indices=image_indices,
+            question_indices=question_positions,
             prompt_len_mm=prompt_len_mm,
             answer_ids=answer_ids,
         )
         del answer_ids
-        traj_scores.append(score)
+        question_traj_scores.append(question_score)
+        answer_traj_scores.append(answer_score)
         t_lengths.append(T)
         predictions.append(prediction)
-        if len(traj_scores) == M:
+        prediction_correctness.append(prediction_correct)
+        if len(answer_traj_scores) == M:
             break
 
-    if len(traj_scores) != M:
+    if len(answer_traj_scores) != M:
         return None, last_prediction
 
-    stacked = torch.stack(traj_scores, dim=0)
-    teacher = stacked.mean(dim=0)
-    teacher_norm = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(eps)
+    question_stacked = torch.stack(question_traj_scores, dim=0)
+    answer_stacked = torch.stack(answer_traj_scores, dim=0)
+    teacher_question_raw = question_stacked.mean(dim=0)
+    teacher_answer_raw = answer_stacked.mean(dim=0)
+    answer_weight = 1.0 - question_weight
+    # Mix normalized distributions so question and answer make the requested
+    # contribution even when their total attention mass differs.
+    teacher_norm, teacher_question_norm, teacher_answer_norm = _mix_teacher_signals(
+        teacher_question_raw,
+        teacher_answer_raw,
+        question_weight,
+        eps,
+    )
 
     return dict(
-        teacher_raw=teacher.to(torch.float16),
+        teacher_raw=teacher_norm.to(torch.float16),
         teacher_norm=teacher_norm.to(torch.float16),
+        teacher_question_raw=teacher_question_raw.to(torch.float16),
+        teacher_question_norm=teacher_question_norm.to(torch.float16),
+        teacher_answer_raw=teacher_answer_raw.to(torch.float16),
+        teacher_answer_norm=teacher_answer_norm.to(torch.float16),
+        teacher_question_weight=float(question_weight),
+        teacher_answer_weight=float(answer_weight),
+        teacher_signal="question_answer_normalized_mix",
+        teacher_question_source="causal_prefill_question_tokens",
+        teacher_answer_source="generated_answer_tokens",
         image_token_indices=image_positions.to(torch.long),
         question_token_indices=question_positions.to(torch.long),
         prompt_len_mm=int(prompt_len_mm),
@@ -369,8 +434,9 @@ def collect_one(
         n_img=int(n_img),
         trajectory_m=M,
         predictions=predictions,
+        predictions_correct=prediction_correctness,
         prediction=predictions[0],
-        prediction_correct=True,
+        prediction_correct=prediction_correctness[0],
     ), predictions[0]
 
 
@@ -525,7 +591,7 @@ def main() -> int:
         "--n-samples",
         type=int,
         default=300,
-        help="Target number of correctly answered teacher samples to save.",
+        help="Target number of teacher samples to save.",
     )
     p.add_argument(
         "--max-candidates",
@@ -554,7 +620,18 @@ def main() -> int:
         default=True,
         help="Save teacher records only when the base model prediction is correct.",
     )
+    p.add_argument(
+        "--question-weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Weight of the normalized question/prefill attention in the teacher; "
+            "answer attention receives 1 - this value."
+        ),
+    )
     args = p.parse_args()
+    if not 0.0 <= args.question_weight <= 1.0:
+        p.error("--question-weight must be in [0, 1]")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -584,12 +661,22 @@ def main() -> int:
         )
     print(
         f"[info] dataset={args.dataset} candidates={len(samples)} "
-        f"target_correct={args.n_samples} require_correct={args.require_correct}",
+        f"target={args.n_samples} require_correct={args.require_correct} "
+        f"question_weight={args.question_weight:.3f} "
+        f"answer_weight={1.0 - args.question_weight:.3f}",
         flush=True,
     )
 
-    existing = len(list(out_dir.glob("*.pt")))
+    existing_paths = list(out_dir.glob("*.pt"))
+    existing = len(existing_paths)
+    existing_correct = 0
+    for existing_path in existing_paths:
+        existing_rec = torch.load(existing_path, weights_only=False, map_location="cpu")
+        existing_correct += int(bool(existing_rec.get("prediction_correct", False)))
+    existing_incorrect = existing - existing_correct
     saved = existing
+    saved_correct = existing_correct
+    saved_incorrect = existing_incorrect
     newly_saved = 0
     evaluated = 0
     rejected_incorrect = 0
@@ -627,6 +714,7 @@ def main() -> int:
                 answer_index=sample["answer_index"],
                 choices=sample["choices"],
                 require_correct=args.require_correct,
+                question_weight=args.question_weight,
             )
             if rec is None:
                 rejected_incorrect += 1
@@ -656,9 +744,14 @@ def main() -> int:
                 ground_truth_answers=list(sample["answers"]),
                 ground_truth_answer_index=sample["answer_index"],
                 ground_truth_choices=list(sample["choices"]),
+                require_correct=args.require_correct,
             )
             torch.save(rec, out_path)
             saved += 1
+            if rec["prediction_correct"]:
+                saved_correct += 1
+            else:
+                saved_incorrect += 1
             newly_saved += 1
             t_list.append(rec["T"])
             if newly_saved == 1:
@@ -681,7 +774,8 @@ def main() -> int:
                 f"[progress] evaluated={evaluated}/{len(samples)} "
                 f"| rate={evaluated/max(elapsed, 1e-6):.2f}/s "
                 f"| elapsed={elapsed:.1f}s | T_mean={np.mean(t_list):.2f} "
-                f"| saved={saved}/{args.n_samples} incorrect={rejected_incorrect} "
+                f"| saved={saved}/{args.n_samples} correct={saved_correct} "
+                f"incorrect={saved_incorrect} rejected={rejected_incorrect} "
                 f"skipped={len(skipped)}",
                 flush=True,
             )
@@ -690,8 +784,9 @@ def main() -> int:
     elapsed = time.time() - t0
     print(
         f"[done] dataset={args.dataset} saved={saved}/{args.n_samples} "
+        f"correct={saved_correct} incorrect={saved_incorrect} "
         f"candidates={len(samples)} evaluated={evaluated} "
-        f"incorrect={rejected_incorrect} skipped={len(skipped)} elapsed={elapsed:.1f}s "
+        f"rejected={rejected_incorrect} skipped={len(skipped)} elapsed={elapsed:.1f}s "
         f"T_mean={np.mean(t_list) if t_list else 0:.2f}",
         flush=True,
     )
@@ -702,7 +797,11 @@ def main() -> int:
         n_requested=args.n_samples,
         n_saved=saved,
         n_existing=existing,
+        n_existing_correct=existing_correct,
+        n_existing_incorrect=existing_incorrect,
         n_newly_saved=newly_saved,
+        n_saved_correct=saved_correct,
+        n_saved_incorrect=saved_incorrect,
         n_candidates=len(samples),
         n_evaluated=evaluated,
         n_rejected_incorrect=rejected_incorrect,
@@ -714,6 +813,8 @@ def main() -> int:
         model=args.model,
         max_new_tokens=args.max_new_tokens,
         require_correct=args.require_correct,
+        question_weight=args.question_weight,
+        answer_weight=1.0 - args.question_weight,
         elapsed_seconds=elapsed,
     ), indent=2))
     print(f"[save] {summary_path}", flush=True)
