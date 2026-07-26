@@ -145,6 +145,72 @@ def _post_visual_token_types(
     return result
 
 
+def _post_visual_cache_positions(
+    past_kv,
+    prompt_len: int,
+    visual_keep_masks: dict[int, torch.Tensor],
+) -> dict[int, torch.Tensor]:
+    """Map each post-Q-ViK cache entry to its RoPE position."""
+    base = torch.arange(int(prompt_len), dtype=torch.long)
+    result: dict[int, torch.Tensor] = {}
+    for layer_idx, (keys, _) in enumerate(_cache_layer_pairs(past_kv)):
+        positions = base
+        if layer_idx in visual_keep_masks:
+            positions = positions[visual_keep_masks[layer_idx].detach().cpu().bool()]
+        if int(positions.numel()) != int(keys.shape[2]):
+            raise ValueError(
+                f"Layer {layer_idx} position map/cache mismatch after visual eviction: "
+                f"map={positions.numel()} cache={keys.shape[2]}."
+            )
+        result[layer_idx] = positions.clone()
+    return result
+
+
+def _rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
+    midpoint = hidden_states.shape[-1] // 2
+    first = hidden_states[..., :midpoint]
+    second = hidden_states[..., midpoint:]
+    return torch.cat((-second, first), dim=-1)
+
+
+def _rerotate_keys(
+    keys: torch.Tensor,
+    old_positions: torch.Tensor,
+    new_positions: torch.Tensor,
+    rotary_emb,
+) -> torch.Tensor:
+    """Move already-RoPE-encoded Qwen2 keys from old to new positions.
+
+    The official StreamingLLM attention keeps unrotated keys in the cache and
+    applies RoPE according to their current cache slots. Qwen2 stores rotated
+    keys, so applying the delta rotation here is the equivalent operation.
+    """
+    if torch.equal(old_positions, new_positions):
+        return keys
+    if keys.shape[2] != old_positions.numel() or old_positions.shape != new_positions.shape:
+        raise ValueError(
+            "RoPE position/key mismatch: "
+            f"keys={keys.shape[2]} old={old_positions.numel()} "
+            f"new={new_positions.numel()}."
+        )
+
+    positions = torch.cat([old_positions, new_positions]).to(
+        device=keys.device, dtype=torch.long
+    ).unsqueeze(0)
+    cos, sin = rotary_emb(keys, positions)
+    split = int(old_positions.numel())
+    old_cos, new_cos = cos[:, :split], cos[:, split:]
+    old_sin, new_sin = sin[:, :split], sin[:, split:]
+
+    # Divide out any RoPE attention scaling so this is a pure delta rotation.
+    denominator = (old_cos.square() + old_sin.square()).clamp_min(1e-12)
+    delta_cos = (old_cos * new_cos + old_sin * new_sin) / denominator
+    delta_sin = (old_cos * new_sin - old_sin * new_cos) / denominator
+    delta_cos = delta_cos.unsqueeze(1)
+    delta_sin = delta_sin.unsqueeze(1)
+    return (keys * delta_cos + _rotate_half(keys) * delta_sin).contiguous()
+
+
 def _mean_count(token_types: dict[int, torch.Tensor], token_type: int | None) -> float:
     counts: list[float] = []
     for types in token_types.values():
@@ -208,15 +274,32 @@ class TextKVCacheManager:
             image_positions,
             visual_keep_masks,
         )
+        self.cache_positions = _post_visual_cache_positions(
+            past_kv,
+            prompt_len,
+            visual_keep_masks,
+        )
         self.h2o_scores: dict[int, torch.Tensor] = {}
         self.eviction_events = 0
         self._first_prompt_kept: float | None = None
 
-    def append_generated_token(self) -> None:
+    def append_generated_token(self, position: int | None = None) -> None:
         for layer_idx, types in self.token_types.items():
             shape = (*types.shape[:-1], 1)
             generated = torch.full(shape, GENERATED_TEXT, dtype=types.dtype)
             self.token_types[layer_idx] = torch.cat([types, generated], dim=-1)
+            if self.config.mode == "streamingllm":
+                generated_position = (
+                    int(self.cache_positions[layer_idx][-1].item()) + 1
+                    if position is None
+                    else int(position)
+                )
+                self.cache_positions[layer_idx] = torch.cat(
+                    [
+                        self.cache_positions[layer_idx],
+                        torch.tensor([generated_position], dtype=torch.long),
+                    ]
+                )
 
     def update_h2o_scores(self, attentions: Sequence[torch.Tensor | None], past_kv) -> None:
         pairs = _cache_layer_pairs(past_kv)
@@ -245,21 +328,44 @@ class TextKVCacheManager:
                 step_scores[:, :old_len] += previous.to(step_scores.device)
             self.h2o_scores[layer_idx] = step_scores
 
-    def prune(self, past_kv):
+    def prune(self, past_kv, *, rotary_emb=None):
         if self.config.mode == "none":
             return past_kv
         if self.config.mode == "streamingllm":
             keep_indices = self._streaming_indices()
+            if rotary_emb is None:
+                raise RuntimeError(
+                    "StreamingLLM requires the language model rotary embedding "
+                    "to apply its position-shift attention."
+                )
         else:
             keep_indices = self._h2o_indices(past_kv)
 
         removed = False
+        shifted_keys: dict[int, torch.Tensor] = {}
+        cache_pairs = _cache_layer_pairs(past_kv)
         for layer_idx, indices in keep_indices.items():
             old_len = int(self.token_types[layer_idx].shape[-1])
             removed = removed or int(indices.shape[-1]) < old_len
             self.token_types[layer_idx] = self._gather_types(
                 self.token_types[layer_idx], indices
             )
+            if self.config.mode == "streamingllm":
+                selected_positions = self.cache_positions[layer_idx].index_select(
+                    0, indices.cpu().long()
+                )
+                new_positions = torch.arange(
+                    selected_positions.numel(), dtype=torch.long
+                )
+                keys = cache_pairs[layer_idx][0]
+                selected_keys = _gather_cache_tensor(keys, indices)
+                shifted_keys[layer_idx] = _rerotate_keys(
+                    selected_keys,
+                    selected_positions,
+                    new_positions,
+                    rotary_emb,
+                )
+                self.cache_positions[layer_idx] = new_positions
             if layer_idx in self.h2o_scores:
                 self.h2o_scores[layer_idx] = self._gather_scores(
                     self.h2o_scores[layer_idx], indices
@@ -268,7 +374,24 @@ class TextKVCacheManager:
             self.eviction_events += 1
         if self._first_prompt_kept is None:
             self._first_prompt_kept = _mean_count(self.token_types, PROMPT_TEXT)
-        return select_kv_cache_per_layer(past_kv, keep_indices)
+        past_kv = select_kv_cache_per_layer(past_kv, keep_indices)
+        if shifted_keys:
+            if not hasattr(past_kv, "key_cache"):
+                raise TypeError(
+                    "StreamingLLM Qwen2 position shift requires a DynamicCache."
+                )
+            for layer_idx, keys in shifted_keys.items():
+                past_kv.key_cache[layer_idx] = keys
+        return past_kv
+
+    def next_streaming_position(self) -> int:
+        lengths = {int(positions.numel()) for positions in self.cache_positions.values()}
+        if len(lengths) != 1:
+            raise RuntimeError(
+                "StreamingLLM needs equal post-eviction cache lengths across layers; "
+                f"got {sorted(lengths)}."
+            )
+        return next(iter(lengths))
 
     def _streaming_indices(self) -> dict[int, torch.Tensor]:
         keep: dict[int, torch.Tensor] = {}
@@ -359,6 +482,9 @@ class TextKVCacheManager:
         )
         return {
             "text_eviction_mode": self.config.mode,
+            "streaming_position_shift": (
+                "qwen2_compact_rope" if self.config.mode == "streamingllm" else "none"
+            ),
             "text_cache_budget": self.budget,
             "n_text_prompt_original": self.prompt_text_tokens,
             "avg_n_text_prompt_kept_after_eviction": prompt_kept,
@@ -393,15 +519,27 @@ def greedy_decode_with_text_eviction(
         visual_keep_masks=visual_keep_masks,
         config=config,
     )
+    rotary_emb = None
     if config.mode == "streamingllm":
-        past_kv = manager.prune(past_kv)
+        language_model = getattr(model, "model", None)
+        rotary_emb = getattr(language_model, "rotary_emb", None)
+        if rotary_emb is None:
+            raise RuntimeError(
+                "StreamingLLM position shift is implemented for a Qwen2-style "
+                "model.model.rotary_emb, but this model does not expose one."
+            )
+        past_kv = manager.prune(past_kv, rotary_emb=rotary_emb)
 
     out_tokens: list[int] = [int(first_next_token.item())]
     if out_tokens[0] == eos_token_id or max_new_tokens <= 1:
         return torch.tensor(out_tokens, dtype=torch.long), manager.stats()
 
     next_token = first_next_token
-    pos = int(prompt_len)
+    pos = (
+        manager.next_streaming_position()
+        if config.mode == "streamingllm"
+        else int(prompt_len)
+    )
     device = next_token.device
     cache_pos = torch.zeros(1, dtype=torch.long, device=device)
     for _ in range(max_new_tokens - 1):
@@ -416,15 +554,19 @@ def greedy_decode_with_text_eviction(
             return_dict=True,
         )
         past_kv = out.past_key_values
-        manager.append_generated_token()
+        manager.append_generated_token(pos)
         if config.mode == "h2o":
             manager.update_h2o_scores(out.attentions, past_kv)
-        past_kv = manager.prune(past_kv)
+        past_kv = manager.prune(past_kv, rotary_emb=rotary_emb)
 
         next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         token = int(next_token.item())
         out_tokens.append(token)
-        pos += 1
+        pos = (
+            manager.next_streaming_position()
+            if config.mode == "streamingllm"
+            else pos + 1
+        )
         if token == eos_token_id:
             break
     return torch.tensor(out_tokens, dtype=torch.long), manager.stats()

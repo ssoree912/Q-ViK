@@ -98,7 +98,11 @@ LOCAL_TASKS = {
     "coco_cap": {
         "base": "coco_cap/coco2017_cap_val.yaml",
         "dataset_path": "parquet",
-        "data_files": {"val": str(DATA_ROOT / "COCO-Caption2017/data/val-*.parquet")},
+        "data_files": {
+            "val": str(
+                DATA_ROOT / "COCOCaps/COCO-Caption2017/data/val-*.parquet"
+            )
+        },
     },
     "nocaps": {
         "base": "nocaps/nocaps_val.yaml",

@@ -12,6 +12,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
@@ -36,6 +37,43 @@ except ImportError as e:
 
 DEFAULT_IMAGE_TOKEN = "<image>"
 LLAVA_IMAGE_TOKEN_INDEX = -200  # qvik.llava_onevision.constants.IMAGE_TOKEN_INDEX
+
+
+def _cuda_sync(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _kv_cache_nbytes(past_kv) -> int:
+    """Return the bytes held by key/value tensors in a Transformers cache."""
+    tensors: list[torch.Tensor] = []
+    if hasattr(past_kv, "key_cache"):
+        tensors.extend(past_kv.key_cache)
+        tensors.extend(past_kv.value_cache)
+    elif hasattr(past_kv, "layers"):
+        for layer in past_kv.layers:
+            keys = getattr(layer, "keys", None)
+            values = getattr(layer, "values", None)
+            if isinstance(keys, torch.Tensor):
+                tensors.append(keys)
+            if isinstance(values, torch.Tensor):
+                tensors.append(values)
+    else:
+        for keys, values in past_kv:
+            tensors.extend((keys, values))
+
+    seen: set[int] = set()
+    total = 0
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor) or id(tensor) in seen:
+            continue
+        seen.add(id(tensor))
+        total += tensor.numel() * tensor.element_size()
+    return int(total)
+
+
+def _bytes_to_gib(value: int | float) -> float:
+    return float(value) / float(1024**3)
 
 
 @register_model("lmms_onevision_student")
@@ -238,6 +276,75 @@ class LmmsOnevisionStudent(lmms):
             summary[summary_key] = sum(
                 float(sample.get(sample_key, 0.0)) for sample in self._keep_stats
             ) / n
+        measured = [
+            sample for sample in self._keep_stats
+            if "decode_seconds" in sample
+        ]
+        if measured:
+            runtime_average_fields = (
+                "prefill_seconds",
+                "decode_seconds",
+                "decode_steps",
+                "num_generated_tokens",
+                "decode_ms_per_step",
+                "end_to_end_seconds",
+                "prefill_peak_allocated_gib",
+                "decode_start_allocated_gib",
+                "decode_peak_allocated_gib",
+                "decode_peak_increment_gib",
+                "peak_allocated_gib",
+                "peak_reserved_gib",
+                "kv_cache_full_prompt_gib",
+                "kv_cache_prompt_gib",
+                "kv_cache_final_gib",
+                "kv_cache_full_final_estimated_gib",
+                "kv_cache_prompt_keep_ratio",
+                "kv_cache_final_keep_ratio_estimated",
+            )
+            for key in runtime_average_fields:
+                summary[f"avg_{key}"] = sum(
+                    float(sample.get(key, 0.0)) for sample in measured
+                ) / len(measured)
+
+            total_decode_seconds = sum(
+                float(sample["decode_seconds"]) for sample in measured
+            )
+            total_decode_steps = sum(
+                int(sample["decode_steps"]) for sample in measured
+            )
+            full_prompt_bytes = sum(
+                int(sample["kv_cache_full_prompt_bytes"]) for sample in measured
+            )
+            kept_prompt_bytes = sum(
+                int(sample["kv_cache_prompt_bytes"]) for sample in measured
+            )
+            full_final_bytes = sum(
+                int(sample["kv_cache_full_final_estimated_bytes"])
+                for sample in measured
+            )
+            kept_final_bytes = sum(
+                int(sample["kv_cache_final_bytes"]) for sample in measured
+            )
+            summary.update({
+                "n_measured_samples": len(measured),
+                "total_decode_seconds": total_decode_seconds,
+                "total_decode_steps": total_decode_steps,
+                "decode_ms_per_step_weighted": (
+                    total_decode_seconds * 1000.0 / max(1, total_decode_steps)
+                ),
+                "kv_cache_prompt_keep_ratio_weighted": (
+                    kept_prompt_bytes / max(1, full_prompt_bytes)
+                ),
+                "kv_cache_prompt_reduction_ratio_weighted": (
+                    1.0 - kept_prompt_bytes / max(1, full_prompt_bytes)
+                ),
+                "kv_cache_final_keep_ratio_weighted_estimated": (
+                    kept_final_bytes / max(1, full_final_bytes)
+                ),
+                "kv_cache_final_reduction_ratio_weighted_estimated": (
+                    1.0 - kept_final_bytes / max(1, full_final_bytes)
+                ),
+            })
         out_dir = self.stats_output_dir or os.getcwd()
         os.makedirs(out_dir, exist_ok=True)
         fname = f"{task_name or 'unknown'}_keep_ratio_stats.json"
@@ -260,6 +367,12 @@ class LmmsOnevisionStudent(lmms):
             IMAGE_TOKEN_INDEX,
         )
 
+        measure_cuda = self._device.type == "cuda" and torch.cuda.is_available()
+        _cuda_sync(self._device)
+        if measure_cuda:
+            torch.cuda.reset_peak_memory_stats(self._device)
+        sample_start = time.perf_counter()
+
         # Build prompt via conv template
         conv = conv_templates[self._conv_template].copy()
         question = context
@@ -278,9 +391,7 @@ class LmmsOnevisionStudent(lmms):
             self._tokenizer.pad_token_id if self._tokenizer.pad_token_id is not None else self._tokenizer.eos_token_id
         ).to(self._device)
 
-        if not visuals or (
-            self.keep_ratio >= 1.0 and self.text_kv_config.mode == "none"
-        ):
+        if not visuals:
             # Fallback: standard generate
             image_tensor = self._llava_process_images(visuals, self._image_processor, self._config) if visuals else None
             if image_tensor is not None:
@@ -353,6 +464,12 @@ class LmmsOnevisionStudent(lmms):
             "n_image_original": n_img,
             "n_image_kept": n_keep,
             "n_text": n_text,
+            "n_text_prompt_original": n_text,
+            "avg_n_text_prompt_kept_after_eviction": float(n_text),
+            "text_prompt_keep_ratio_after_eviction": 1.0,
+            "avg_n_text_cache_final": float(n_text),
+            "avg_n_visual_cache_final": float(n_keep),
+            "text_eviction_events": 0,
             "prompt_len": prompt_len,
             "image_token_ratio": n_img / max(1, prompt_len),
             "text_token_ratio": n_text / max(1, prompt_len),
@@ -368,29 +485,6 @@ class LmmsOnevisionStudent(lmms):
             )
             self._reported_keep_budget = True
 
-        # Prefill
-        try:
-            prefill = self._model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=new_attn_mask,
-                use_cache=True,
-                output_hidden_states=True,
-                output_attentions=False,
-                return_dict=True,
-            )
-        except Exception as e:
-            print(f"[lmms-onevision-student] prefill failed ({e})", file=sys.stderr, flush=True)
-            return ""
-
-        H_all = prefill.hidden_states
-        past_kv = prefill.past_key_values
-        next_token = prefill.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        eos_token_id = int(
-            self._tokenizer.eos_token_id
-            if self._tokenizer.eos_token_id is not None
-            else 151645
-        )
-
         last_img = int(image_positions.max().item())
         q_positions = (
             torch.arange(last_img + 1, prompt_len, dtype=torch.long)
@@ -399,23 +493,97 @@ class LmmsOnevisionStudent(lmms):
         image_idx_dev = image_positions.to(self._device)
         q_idx_dev = q_positions.to(self._device)
 
-        keep_masks: dict[int, torch.Tensor] = {}
-        for li in self.student.layer_indices:
-            H_l = H_all[li + 1]
-            scores = self.student.layers[str(li)](H_l, image_idx_dev, q_idx_dev).squeeze(0)
-            if n_keep >= n_img:
-                continue
-            top = torch.topk(scores, k=n_keep, largest=True).indices
-            mask = torch.ones(prompt_len, dtype=torch.bool)
-            image_keep = torch.zeros(n_img, dtype=torch.bool)
-            image_keep[top.cpu()] = True
-            mask[image_positions.cpu()] = image_keep
-            keep_masks[li] = mask
+        # Score each layer as soon as its hidden state is produced. Asking
+        # Qwen2 for output_hidden_states retains all 29 [T,H] tensors on GPU;
+        # the longest MileBench prompts cannot fit those together with the KV
+        # cache. Hooks retain only the small per-image-token student scores.
+        layer_scores: dict[int, torch.Tensor] = {}
+        hook_handles = []
+        num_layers = len(self._model.model.layers)
+        needs_visual_pruning = n_keep < n_img
 
-        del H_all, prefill
+        def _capture_layer(layer_idx: int):
+            def _hook(_module, _inputs, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                layer_scores[layer_idx] = self.student.layers[str(layer_idx)](
+                    hidden, image_idx_dev, q_idx_dev
+                ).squeeze(0).detach()
+            return _hook
+
+        if needs_visual_pruning:
+            for li in self.student.layer_indices:
+                source = (
+                    self._model.model.norm
+                    if li == num_layers - 1
+                    else self._model.model.layers[li]
+                )
+                hook_handles.append(source.register_forward_hook(_capture_layer(li)))
+
+        # Prefill through the Qwen2 backbone. Calling the CausalLM wrapper here
+        # materializes [prompt_len, vocab_size] logits even though only the last
+        # token is used, which OOMs on MileBench's longest prompts.
+        _cuda_sync(self._device)
+        prefill_start = time.perf_counter()
+        try:
+            prefill = self._model.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=new_attn_mask,
+                use_cache=True,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=True,
+            )
+        except Exception as e:
+            print(f"[lmms-onevision-student] prefill failed ({e})", file=sys.stderr, flush=True)
+            return ""
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        past_kv = prefill.past_key_values
+        last_logits = self._model.lm_head(prefill.last_hidden_state[:, -1:, :])
+        next_token = last_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        kv_cache_full_prompt_bytes = _kv_cache_nbytes(past_kv)
+        eos_token_id = int(
+            self._tokenizer.eos_token_id
+            if self._tokenizer.eos_token_id is not None
+            else 151645
+        )
+
+        keep_masks: dict[int, torch.Tensor] = {}
+        if needs_visual_pruning:
+            for li in self.student.layer_indices:
+                if li not in layer_scores:
+                    raise RuntimeError(f"Missing student score for language layer {li}.")
+                scores = layer_scores[li]
+                top = torch.topk(scores, k=n_keep, largest=True).indices
+                mask = torch.ones(prompt_len, dtype=torch.bool)
+                image_keep = torch.zeros(n_img, dtype=torch.bool)
+                image_keep[top.cpu()] = True
+                mask[image_positions.cpu()] = image_keep
+                keep_masks[li] = mask
+
+        del layer_scores, prefill, last_logits, inputs_embeds, image_tensor
+        past_kv = trim_kv_cache_per_layer(past_kv, keep_masks)
+        kv_cache_prompt_bytes = _kv_cache_nbytes(past_kv)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        past_kv = trim_kv_cache_per_layer(past_kv, keep_masks)
+        _cuda_sync(self._device)
+        prefill_seconds = time.perf_counter() - prefill_start
+
+        prefill_peak_allocated = (
+            torch.cuda.max_memory_allocated(self._device) if measure_cuda else 0
+        )
+        prefill_peak_reserved = (
+            torch.cuda.max_memory_reserved(self._device) if measure_cuda else 0
+        )
+        decode_start_allocated = (
+            torch.cuda.memory_allocated(self._device) if measure_cuda else 0
+        )
+        if measure_cuda:
+            torch.cuda.reset_peak_memory_stats(self._device)
+        _cuda_sync(self._device)
+        decode_start = time.perf_counter()
 
         if self.text_kv_config.mode == "none":
             answer_ids = greedy_decode_with_kv(
@@ -436,5 +604,65 @@ class LmmsOnevisionStudent(lmms):
                 config=self.text_kv_config,
             )
             self._keep_stats[-1].update(text_stats)
+        _cuda_sync(self._device)
+        decode_seconds = time.perf_counter() - decode_start
+        decode_peak_allocated = (
+            torch.cuda.max_memory_allocated(self._device) if measure_cuda else 0
+        )
+        decode_peak_reserved = (
+            torch.cuda.max_memory_reserved(self._device) if measure_cuda else 0
+        )
+        kv_cache_final_bytes = _kv_cache_nbytes(past_kv)
+        num_generated_tokens = int(answer_ids.numel())
+        decode_steps = max(0, num_generated_tokens - 1)
+        kv_bytes_per_token = (
+            kv_cache_full_prompt_bytes / max(1, prompt_len)
+        )
+        kv_cache_full_final_estimated_bytes = int(round(
+            kv_cache_full_prompt_bytes + decode_steps * kv_bytes_per_token
+        ))
+        self._keep_stats[-1].update({
+            "prefill_seconds": prefill_seconds,
+            "decode_seconds": decode_seconds,
+            "decode_steps": decode_steps,
+            "num_generated_tokens": num_generated_tokens,
+            "decode_ms_per_step": (
+                decode_seconds * 1000.0 / max(1, decode_steps)
+            ),
+            "end_to_end_seconds": time.perf_counter() - sample_start,
+            "prefill_peak_allocated_gib": _bytes_to_gib(prefill_peak_allocated),
+            "decode_start_allocated_gib": _bytes_to_gib(decode_start_allocated),
+            "decode_peak_allocated_gib": _bytes_to_gib(decode_peak_allocated),
+            "decode_peak_increment_gib": _bytes_to_gib(
+                max(0, decode_peak_allocated - decode_start_allocated)
+            ),
+            "peak_allocated_gib": _bytes_to_gib(
+                max(prefill_peak_allocated, decode_peak_allocated)
+            ),
+            "peak_reserved_gib": _bytes_to_gib(
+                max(prefill_peak_reserved, decode_peak_reserved)
+            ),
+            "kv_cache_full_prompt_bytes": kv_cache_full_prompt_bytes,
+            "kv_cache_prompt_bytes": kv_cache_prompt_bytes,
+            "kv_cache_final_bytes": kv_cache_final_bytes,
+            "kv_cache_full_final_estimated_bytes": (
+                kv_cache_full_final_estimated_bytes
+            ),
+            "kv_cache_full_prompt_gib": _bytes_to_gib(
+                kv_cache_full_prompt_bytes
+            ),
+            "kv_cache_prompt_gib": _bytes_to_gib(kv_cache_prompt_bytes),
+            "kv_cache_final_gib": _bytes_to_gib(kv_cache_final_bytes),
+            "kv_cache_full_final_estimated_gib": _bytes_to_gib(
+                kv_cache_full_final_estimated_bytes
+            ),
+            "kv_cache_prompt_keep_ratio": (
+                kv_cache_prompt_bytes / max(1, kv_cache_full_prompt_bytes)
+            ),
+            "kv_cache_final_keep_ratio_estimated": (
+                kv_cache_final_bytes
+                / max(1, kv_cache_full_final_estimated_bytes)
+            ),
+        })
         torch.cuda.empty_cache()
         return self._tokenizer.decode(answer_ids.tolist(), skip_special_tokens=True).strip()

@@ -4,7 +4,44 @@ import torch
 from transformers import DynamicCache
 
 from qvik.eval.kv_decode_utils import trim_kv_cache_per_layer
-from qvik.eval.text_kv_eviction import TextKVCacheManager, TextKVConfig
+from qvik.eval.text_kv_eviction import (
+    TextKVCacheManager,
+    TextKVConfig,
+    _rerotate_keys,
+    _rotate_half,
+)
+
+
+class _RotaryEmbedding:
+    def __init__(self, dim: int, base: float = 10000.0) -> None:
+        self.inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        )
+
+    def __call__(self, x: torch.Tensor, position_ids: torch.Tensor):
+        freqs = torch.einsum(
+            "bi,j->bij", position_ids.float(), self.inv_freq.to(position_ids.device)
+        )
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
+
+
+class _IdentityRotaryEmbedding:
+    def __call__(self, x: torch.Tensor, position_ids: torch.Tensor):
+        shape = (*position_ids.shape, x.shape[-1])
+        return (
+            torch.ones(shape, dtype=x.dtype, device=x.device),
+            torch.zeros(shape, dtype=x.dtype, device=x.device),
+        )
+
+
+def _apply_rope(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_emb: _RotaryEmbedding,
+) -> torch.Tensor:
+    cos, sin = rotary_emb(hidden_states, positions.unsqueeze(0))
+    return hidden_states * cos.unsqueeze(1) + _rotate_half(hidden_states) * sin.unsqueeze(1)
 
 
 def _cache(num_layers: int, num_heads: int, seq_len: int) -> DynamicCache:
@@ -37,7 +74,7 @@ def test_streamingllm_only_evicts_text_after_visual_mask() -> None:
             streaming_sink_size=1,
         ),
     )
-    past = manager.prune(past)
+    past = manager.prune(past, rotary_emb=_IdentityRotaryEmbedding())
 
     # Q-ViK visual survivors are original positions 2 and 4.  StreamingLLM
     # additionally retains the first text token and two most recent text tokens.
@@ -45,6 +82,21 @@ def test_streamingllm_only_evicts_text_after_visual_mask() -> None:
     assert torch.equal(past.key_cache[0][0, 0, :, 0], expected)
     assert manager.stats()["avg_n_visual_cache_final"] == 2.0
     assert manager.stats()["avg_n_text_cache_final"] == 3.0
+
+
+def test_streamingllm_rerotates_qwen_keys_to_compact_cache_positions() -> None:
+    rotary_emb = _RotaryEmbedding(dim=4)
+    unrotated = torch.randn(1, 2, 3, 4)
+    old_positions = torch.tensor([0, 5, 9])
+    new_positions = torch.tensor([0, 1, 2])
+    old_keys = _apply_rope(unrotated, old_positions, rotary_emb)
+
+    shifted = _rerotate_keys(
+        old_keys, old_positions, new_positions, rotary_emb
+    )
+    expected = _apply_rope(unrotated, new_positions, rotary_emb)
+
+    torch.testing.assert_close(shifted, expected, atol=1e-5, rtol=1e-5)
 
 
 def test_h2o_uses_per_head_heavy_hitters_and_protects_visual_tokens() -> None:

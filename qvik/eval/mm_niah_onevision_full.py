@@ -95,11 +95,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--text_eviction_mode",
-        choices=("none", "h2o"),
+        choices=("none", "streamingllm", "h2o"),
         default="none",
     )
     parser.add_argument("--text_keep_ratio", type=float, default=1.0)
     parser.add_argument("--h2o_recent_ratio", type=float, default=0.5)
+    parser.add_argument("--streaming_sink_size", type=int, default=4)
     parser.add_argument(
         "--output_dir",
         type=Path,
@@ -1030,6 +1031,7 @@ def main() -> None:
         mode=args.text_eviction_mode,
         keep_ratio=args.text_keep_ratio,
         h2o_recent_ratio=args.h2o_recent_ratio,
+        streaming_sink_size=args.streaming_sink_size,
     ).normalized()
     device = torch.device(args.device)
     model_name = get_model_name_from_path(args.pretrained)

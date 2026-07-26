@@ -111,6 +111,7 @@ def main():
     parser.add_argument("--log_root", default=LOG_ROOT)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max_new_tokens", type=int, default=MAX_NEW_TOKENS)
+    parser.add_argument("--start_index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -134,12 +135,16 @@ def _run(args):
     data = json.load(open(data_path))
     meta = data["meta_data"]
     samples = data["data"]
+    if args.start_index < 0:
+        raise ValueError("--start_index must be >= 0")
+    samples = samples[args.start_index:]
     if args.limit is not None:
         samples = samples[:args.limit]
     combined_img_root = os.path.join(args.data_root, args.dataset, "combined_1_images")
 
     print(
-        f"[{args.dataset}] {len(samples)} samples | keep_ratio={args.keep_ratio} "
+        f"[{args.dataset}] {len(samples)} samples (start_index={args.start_index}) "
+        f"| keep_ratio={args.keep_ratio} "
         f"keep_ratio_basis=image text_eviction={args.text_eviction_mode} "
         f"text_keep_ratio={args.text_keep_ratio} max_new_tokens={args.max_new_tokens}"
     )
