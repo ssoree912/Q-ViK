@@ -134,20 +134,7 @@ python qvik/train/llava15.py \
 
 ### 3. Evaluation
 
-
-Results are written to `results/<model_tag>/keep<keep_ratio>/<task>/`
-(`model_tag` is `llava15_lmms` or `onevision_lmms`). Available tasks: `textvqa`,
-`chartqa`, `docvqa`, `gqa`, `coco_cap`, `nocaps`, `textcaps`.
-
-`keep_ratio` is the fraction of image tokens kept (text KVs are never evicted)
-for both backbones. LLaVA-1.5 also accepts `keep_ratio_basis=total`, where the
-budget is `keep_ratio` x all prompt tokens (still evicting image tokens only).
-
-The first answer token comes from the full (uncompressed) prefill and eviction
-applies from the second token on (`prefill_mode=origin`, the default). Pass
-`prefill_mode=qvik` in `--model_args` for delayed replay, where the last prompt
-token is replayed through the compressed cache so the first answer token is
-also produced under eviction.
+`keep_ratio` is the fraction of image tokens kept in the KV cache (text KVs are never evicted). Results are written to `results/<model_tag>/keep<keep_ratio>/<task>/`.
 
 **lmms-eval (LLaVA-1.5)** 
 ```bash
