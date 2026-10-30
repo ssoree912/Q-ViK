@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+results/
+logs/
+/model
+data/eval
+data/train/gqa
+data/train/scienceqa
+data/train/textvqa
+data/train/teacher/
+ckpts/
+/data
+.ipynb_checkpoints/
