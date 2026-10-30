@@ -169,13 +169,3 @@ python qvik/eval/run_lmms_eval.py \
   --output_path results
 ```
 
-
-
-## License
-
-This project is released under the [Apache License 2.0](LICENSE).
-
-It includes code adapted from the following projects, each distributed under the Apache License 2.0 (see the `LICENSE` file in each directory):
-
-- [LLaVA](https://github.com/haotian-liu/LLaVA) — `qvik/llava15/`
-- [LLaVA-NeXT](https://github.com/LLaVA-VL/LLaVA-NeXT) — `qvik/llava_onevision/`
