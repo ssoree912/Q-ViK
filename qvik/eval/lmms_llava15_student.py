@@ -157,7 +157,6 @@ class LmmsLlava15Student(lmms):
         student_path: str = str(ZAP_ROOT / "ckpts/qvik_student_llava15"),
         vision_tower_path: str = "",
         keep_ratio: float = 0.5,
-        keep_ratio_basis: str = "image",
         device: str = "cuda:0",
         device_map: str = "cuda:0",
         model_name: Optional[str] = None,
@@ -218,9 +217,6 @@ class LmmsLlava15Student(lmms):
             self.student = None
         self.student_path = student_path
         self.keep_ratio = float(keep_ratio)
-        self.keep_ratio_basis = str(keep_ratio_basis).strip().lower()
-        if self.keep_ratio_basis not in {"total", "image"}:
-            raise ValueError("keep_ratio_basis must be either 'total' or 'image'.")
         self.conv_template = conv_template
         self.max_new_tokens = int(max_new_tokens)
         self.image_feature_len = int(image_feature_len)
@@ -386,7 +382,6 @@ class LmmsLlava15Student(lmms):
         summary = {
             "task": task_name,
             "keep_ratio": self.keep_ratio,
-            "keep_ratio_basis": self.keep_ratio_basis,
             "n_samples": n,
             "prefill_mode": self.prefill_mode,
             "avg_image_token_ratio": sum(s["image_token_ratio"] for s in self._keep_stats) / n,
@@ -516,11 +511,7 @@ class LmmsLlava15Student(lmms):
 
         n_img = int(image_positions.numel())
         n_text = int(prompt_len) - n_img
-        if self.keep_ratio_basis == "image":
-            n_keep = max(1, math.ceil(n_img * self.keep_ratio))
-        else:
-            n_keep = max(1, round(n_img - (1.0 - self.keep_ratio) * int(prompt_len)))
-        n_keep = min(n_keep, n_img)
+        n_keep = min(max(1, math.ceil(n_img * self.keep_ratio)), n_img)
 
         last_img = int(image_positions.max().item())
         q_positions = (
@@ -612,8 +603,7 @@ class LmmsLlava15Student(lmms):
         )
         if not self._reported_keep_budget:
             print(
-                f"[lmms-llava15-student] keep_ratio_basis={self.keep_ratio_basis} "
-                f"keep_ratio={self.keep_ratio} prompt_len={prompt_len} image_tokens={n_img} "
+                f"[lmms-llava15-student] keep_ratio={self.keep_ratio} prompt_len={prompt_len} image_tokens={n_img} "
                 f"text_tokens={n_text} image_tokens_kept={n_keep}",
                 file=sys.stderr,
                 flush=True,

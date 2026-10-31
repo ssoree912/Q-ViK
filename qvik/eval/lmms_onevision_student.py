@@ -353,7 +353,7 @@ class LmmsOnevisionStudent(lmms):
         })
         if not self._reported_keep_budget:
             print(
-                f"[lmms-onevision-student] LLAVA keep_ratio_basis=image keep_ratio={self.keep_ratio} "
+                f"[lmms-onevision-student] LLAVA keep_ratio={self.keep_ratio} "
                 f"prompt_len={prompt_len} image_tokens={n_img} text_tokens={n_text} "
                 f"image_tokens_kept={n_keep}",
                 file=sys.stderr, flush=True,
